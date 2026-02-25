@@ -1,6 +1,9 @@
 package com.oceanodosdados.consumer;
 import org.springframework.stereotype.Component;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+
+import java.util.Map;
+
 import org.springframework.amqp.rabbit.annotation.RabbitHandler;
 import com.oceanodosdados.config.RabitMQConfig;
 
@@ -9,8 +12,8 @@ import com.oceanodosdados.config.RabitMQConfig;
 public class Consumer {
 
     @RabbitHandler
-    public void receiveMessage(String message) {
-        System.out.println("=========================================================");
-        System.out.println("Received Message: " + message);
-    }
+    public void consumir(Map<String, Object> payload) {
+    System.out.println("Mensagem recebida:");
+    System.out.println(payload);
+}
 }

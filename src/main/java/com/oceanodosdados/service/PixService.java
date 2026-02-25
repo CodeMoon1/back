@@ -1,80 +1,87 @@
 package com.oceanodosdados.service;
 
-import br.com.efi.efisdk.EfiPay;
-import br.com.efi.efisdk.exceptions.EfiPayException;
 import com.oceanodosdados.config.Credentials;
+import com.oceanodosdados.repository.PixRepository;
 import com.oceanodosdados.domain.PixCharge;
 import com.oceanodosdados.enums.StatusEfi;
 import com.oceanodosdados.records.apiPix.PixRequest;
-import com.oceanodosdados.repository.PixRepository;
+
 import jakarta.transaction.Transactional;
-import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.io.HttpClientConnectionManager;
+import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactory;
+import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder;
+import org.apache.hc.core5.ssl.SSLContexts;
+import org.json.JSONObject;
 
-import javax.imageio.ImageIO;
-import java.io.ByteArrayInputStream;
-import java.io.File;
+import javax.net.ssl.SSLContext;
+import java.io.FileInputStream;
+import java.security.KeyStore;
 import java.util.Base64;
-import java.util.HashMap;
 
 @Service
 public class PixService {
 
-    // 1. Inicializa o logger para esta classe.
-    private static final Logger log = LoggerFactory.getLogger(PixService.class);
-    private  Credentials credentials;
-    private final String keyPix;
+    private static final Logger log = LoggerFactory.getLogger(PixService.class );
+
+    @Value("${chave.pix}")
+    private String keyPix;
+
+    private final Credentials credentials;
     private final PixRepository pixRepository;
-    private final String certPath;
+    private final RestTemplate restTemplate;
 
-    public PixService(
-            Credentials credentials,
-            @Value("${chave.pix}") String keyPix,
-            PixRepository pixRepository
-    ) {
-        
+    public PixService(Credentials credentials, PixRepository pixRepository) {
         this.credentials = credentials;
-        this.keyPix = keyPix;
         this.pixRepository = pixRepository;
-
-        this.certPath = credentials.certificate();
-        File certFile = new File(this.certPath);
-
-        if (!certFile.exists() || !certFile.canRead()) {
-            throw new IllegalStateException(
-                    "Certificado não encontrado ou sem permissão: " + this.certPath
-            );
-        }
-        log.info("Ambiente PIX | sandbox={} | cert={}", 
-         credentials.sandbox(), certPath);
-
-        log.info("PixService inicializado. Certificado OK em {}", this.certPath);
+        this.restTemplate = createIsolatedRestTemplate();
     }
 
-
-    private EfiPay criarCliente() {
+    private RestTemplate createIsolatedRestTemplate() {
         try {
-            JSONObject options = new JSONObject();
-            options.put("client_id", credentials.clientId());
-            options.put("client_secret", credentials.clientSecret());
-            options.put("certificate", certPath);
-            options.put("sandbox", credentials.sandbox());
-            options.put("debug", credentials.debug());
+            KeyStore keyStore = KeyStore.getInstance("PKCS12");
+            try (FileInputStream fis = new FileInputStream(credentials.certificate())) {
+                keyStore.load(fis, "".toCharArray());
+            }
 
-            return new EfiPay(options);
+            SSLContext sslContext = SSLContexts.custom()
+                    .loadKeyMaterial(keyStore, "".toCharArray())
+                    .build();
+
+            SSLConnectionSocketFactory sslSocketFactory = SSLConnectionSocketFactoryBuilder.create()
+                    .setSslContext(sslContext)
+                    .build();
+
+            HttpClientConnectionManager cm = PoolingHttpClientConnectionManagerBuilder.create()
+                    .setSSLSocketFactory(sslSocketFactory)
+                    .build();
+
+            CloseableHttpClient httpClient = HttpClients.custom( )
+                    .setConnectionManager(cm)
+                    .evictExpiredConnections()
+                    .build();
+
+            return new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient ));
         } catch (Exception e) {
-            throw new IllegalStateException("Erro ao criar cliente EFI", e);
+            log.error("Falha crítica ao inicializar o cliente HTTP seguro para Efí", e);
+            throw new RuntimeException("Erro ao configurar SSL para Pix", e);
         }
     }
-
 
     public JSONObject criaPix(PixRequest pixRequest) {
-        EfiPay efi = criarCliente();
-
+        log.info("Iniciando criação de cobrança PIX para o CPF: {}", pixRequest.cpf());
         try {
+            String accessToken = getAccessToken();
+
             JSONObject body = new JSONObject();
             body.put("calendario", new JSONObject().put("expiracao", 3600));
             body.put("devedor", new JSONObject()
@@ -84,25 +91,89 @@ public class PixService {
             body.put("chave", keyPix);
             body.put("solicitacaoPagador", "Serviço realizado");
 
-            JSONObject response =
-                    efi.call("pixCreateImmediateCharge", new HashMap<>(), body);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.setBearerAuth(accessToken);
 
-            processAndSave(response);
-            return response;
+            HttpEntity<String> entity = new HttpEntity<>(body.toString(), headers);
 
-        } catch (EfiPayException e) {
-            throw new RuntimeException("Erro EFI: " + e.getErrorDescription(), e);
+            String baseUrl = credentials.sandbox() ? "https://pix-h.api.efipay.com.br" : "https://pix.api.efipay.com.br";
+            String url = baseUrl + "/v2/cob";
+
+            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class );
+
+            if (response.getStatusCode() == HttpStatus.CREATED || response.getStatusCode() == HttpStatus.OK) {
+                JSONObject jsonResponse = new JSONObject(response.getBody());
+                processAndSave(jsonResponse);
+                return jsonResponse;
+            } else {
+                throw new RuntimeException("Erro na API Efí: " + response.getStatusCode());
+            }
         } catch (Exception e) {
-            log.error("Erro técnico ao chamar API PIX", e);
-            throw new RuntimeException("Erro técnico PIX", e);
+            log.error("Erro técnico ao processar PIX (Conflito RabbitMQ evitado)", e);
+            throw new RuntimeException("Erro técnico PIX: " + e.getMessage(), e);
         }
     }
+
+    private String getAccessToken() {
+    try {
+        String baseUrl = credentials.sandbox() ? "https://pix-h.api.efipay.com.br" : "https://pix.api.efipay.com.br";
+        String url = baseUrl + "/oauth/token";
+
+        HttpHeaders headers = new HttpHeaders( );
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        
+        // Autenticação básica com ClientID e ClientSecret
+        String auth = credentials.clientId() + ":" + credentials.clientSecret();
+        String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
+        headers.set("Authorization", "Basic " + encodedAuth);
+
+        // O corpo deve ser exatamente este para a Efí
+        HttpEntity<String> entity = new HttpEntity<>("{\"grant_type\": \"client_credentials\"}", headers);
+
+        log.info("Tentando obter token OAuth na URL: {}", url);
+        ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+        
+        JSONObject json = new JSONObject(response.getBody());
+        return json.getString("access_token");
+
+    } catch (org.springframework.web.client.HttpClientErrorException e) {
+        // Log detalhado do erro retornado pela Efí (ex: 401 Unauthorized)
+        log.error("Erro de autenticação da Efí (HTTP {}): {}", e.getStatusCode(), e.getResponseBodyAsString());
+        throw new RuntimeException("Falha na autenticação com Efí: Verifique ClientID/Secret");
+    } catch (Exception e) {
+        log.error("Erro inesperado ao obter token", e);
+        throw new RuntimeException("Falha na autenticação com Efí: " + e.getMessage());
+    }
+}
+
+
+    private JSONObject buscarQRCode(int locId) {
+    try {
+        String accessToken = getAccessToken();
+        String baseUrl = credentials.sandbox() ? "https://pix-h.api.efipay.com.br" : "https://pix.api.efipay.com.br";
+        String url = baseUrl + "/v2/loc/" + locId + "/qrcode";
+
+        HttpHeaders headers = new HttpHeaders( );
+        headers.setBearerAuth(accessToken);
+        HttpEntity<Void> entity = new HttpEntity<>(headers);
+
+        log.info("Buscando QR Code para locId: {}", locId);
+        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+
+        return new JSONObject(response.getBody());
+    } catch (Exception e) {
+        log.error("Erro ao buscar QR Code na Efí", e);
+        throw new RuntimeException("Falha ao gerar QR Code");
+    }
+}
+
 
 
     @Transactional
     public void processAndSave(JSONObject response) throws Exception {
         log.info("Processando e salvando dados da cobrança com TxID: {}", response.getString("txid"));
-        // ... (seu código de processamento continua igual)
+        
         String txid = response.getString("txid");
         String pixCopiaECola = response.getString("pixCopiaECola");
         StatusEfi status = StatusEfi.valueOf(response.getString("status"));
@@ -112,44 +183,8 @@ public class PixService {
         Integer locId = response.getJSONObject("loc").getInt("id");
         
         PixCharge payment = new PixCharge(txid, valor, status, pixCopiaECola, locId, data, cpf);
-
         pixRepository.save(payment);
+        
         log.info("Cobrança com TxID: {} salva com sucesso no banco de dados.", txid);
     }
-
-    public JSONObject getPixQrCode(int id) {
-    EfiPay efi = criarCliente();
-
-    log.info("Iniciando geração de QR Code para a localização PIX de ID: {}", id);
-
-    HashMap<String, String> params = new HashMap<>();
-    params.put("id", String.valueOf(id));
-
-    try {
-        JSONObject response =
-                efi.call("pixGenerateQRCode", params, new JSONObject());
-
-        String base64Image = response.getString("imagemQrcode");
-        byte[] imageBytes = Base64.getDecoder()
-                .decode(base64Image.split(",")[1]);
-
-        File outputfile = new File("qrCodeImage.png");
-        ImageIO.write(
-                ImageIO.read(new ByteArrayInputStream(imageBytes)),
-                "png",
-                outputfile
-        );
-
-        log.info("QR Code salvo em {}", outputfile.getAbsolutePath());
-        return response;
-
-    } catch (EfiPayException e) {
-        throw new RuntimeException("Erro EFI: " + e.getErrorDescription(), e);
-    } catch (Exception e) {
-        
-        log.error("Erro técnico ao criar PIX", e);
-        throw new RuntimeException("Erro técnico ao gerar QR Code", e);
-    }
-}
-
 }
